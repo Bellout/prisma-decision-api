@@ -158,9 +158,14 @@ public static class InfluenceDiagramDtoExtensions
 
     private static void NormalizeProbabilities(ICollection<DiscreteProbabilityDto> discreteProbabilities)
     {
-        var probabilityRows = discreteProbabilities.GroupBy(dp =>
-                    string.Join(",", dp.ParentOptionIds.OrderBy(x => x)
-                        .Concat(dp.ParentOutcomeIds.OrderBy(x => x)))).ToList();
+        // A row of a conditional probability table is one uncertainty under one
+        // configuration of its parents. Rows of different uncertainties that
+        // share a parent configuration are separate rows.
+        var probabilityRows = discreteProbabilities.GroupBy(dp => (
+                dp.UncertaintyId,
+                ParentOptions: string.Join(",", dp.ParentOptionIds.OrderBy(x => x)),
+                ParentOutcomes: string.Join(",", dp.ParentOutcomeIds.OrderBy(x => x))))
+            .ToList();
         foreach (var row in probabilityRows)
         {
             int precision = 2;
