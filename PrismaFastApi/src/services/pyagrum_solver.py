@@ -1,12 +1,19 @@
 import json
 import uuid
+import numpy as np
 import pyagrum as gum  # type: ignore
+import xarray as xr
+from pydantic import BaseModel
 from pathlib import Path
+from functools import reduce
 from itertools import product
+from operator import add
 from threading import Lock
 from src.config import config
-from src.constants import Type
+from src.constants import Type, default_value_metric_id
+from src.dtos.margin_table_dtos import MarginTableRowDto
 from src.utils.discrete_probability_array_manager import DiscreteProbabilityArrayManager
+from src.utils.discrete_utility_array_manager import DiscreteUtilityArrayManager
 from src.dtos.issue_dtos import IssueOutgoingDto
 from src.dtos.edge_dtos import EdgeOutgoingDto
 from src.dtos.option_dtos import OptionOutgoingDto
@@ -26,9 +33,13 @@ from typing import Any, TypeVar, Optional
 T = TypeVar("T", OptionOutgoingDto, OutcomeOutgoingDto)
 
 _EXPORT_MODEL_LOCK = Lock()
+_COMBINED_UTILITY_NODE_NAME = "combined_utility"
 
 # run for each optimal solution
 
+class ParsedTensor(BaseModel):
+    states: list[str]
+    value: float
 
 class PyagrumSolver:
     def __init__(self):
@@ -53,6 +64,7 @@ class PyagrumSolver:
         edges: list[EdgeOutgoingDto],
         discrete_probabilities: list[DiscreteProbabilityOutgoingDto],
         discrete_utilities: list[DiscreteUtilityOutgoingDto],
+        use_combined_utility_node: bool = True,
     ):
         self.issues = issues
         self.edges = edges
@@ -61,8 +73,11 @@ class PyagrumSolver:
         self.add_nodes(issues)
         self.add_edges(edges)
         self.fill_cpts(issues)
-        self.add_virtual_utilities(issues)
-        self.fill_utilities(issues)
+        if use_combined_utility_node:
+            self.combine_utility_nodes(issues)
+        else:
+            self.add_virtual_utility_node(issues)
+            self.fill_utility_table(issues)
 
     def raise_if_issues_edges_not_set(self):
         if not self.issues:
@@ -70,6 +85,14 @@ class PyagrumSolver:
 
     def _sort_state_dtos(self, dtos: list[T]) -> list[T]:
         return sorted(dtos, key=lambda x: x.id.__str__())
+
+    def _get_all_options_combinations(self) -> list[list[str]]:
+        from itertools import product
+        all_options: list[list[str]] = []
+        for issue in self.issues:
+            if issue.type == Type.DECISION.value and issue.decision is not None:
+                all_options.append([str(option.id) for option in issue.decision.options])
+        return list(product(*all_options))
 
     def _find_state(
         self, state_id: str, issues: Optional[list[IssueOutgoingDto]] = None
@@ -197,7 +220,23 @@ class PyagrumSolver:
         return SolutionDto(
             decision_solutions=[self.get_optimal_decisions(ie, x) for x in decisions]
         )
-
+    def get_margins(self) -> dict[str, list[MarginTableRowDto]]:
+        margins: dict[str, list[MarginTableRowDto]] = {}
+        if self.ie is None:
+            raise RuntimeError(
+                "Inference engine has not been initialized. Call build_inference_engine or find_optimal_decisions first."
+            )
+        for issue in self.issues:
+            if issue.type != Type.UNCERTAINTY.value:
+                continue
+            # need to set the evidence for all possible decision paths
+            parent_combinations = self._get_all_options_combinations()
+            for combination in parent_combinations:
+                self.set_evidence(self.ie, list(combination))
+                margin = self.ie.posterior(issue.id.__str__())
+                margins[f"{issue.id.__str__()} | {'_'.join(list(combination))}"] = self._parse_margin_tensor(issue.id.__str__(), margin, list(combination))
+        return margins  # type: ignore
+    
     def get_inference(self) -> gum.ShaferShenoyLIMIDInference:
         if self.ie is None:
             raise RuntimeError(
@@ -440,60 +479,157 @@ class PyagrumSolver:
         else:
             return probabilities
 
-    def fill_utility_table(self, issue: IssueOutgoingDto):
-        if issue.type in [Type.DECISION.value, Type.UNCERTAINTY.value]:
-            return
-        assert issue.utility is not None
+    def _get_utility_value_metric_id(self) -> uuid.UUID:
+        value_metric_ids = {utility.value_metric_id for utility in self.discrete_utilities}
+        if len(value_metric_ids) > 1:
+            raise ValueError("All utilities must use the same value metric")
+        return next(iter(value_metric_ids), default_value_metric_id)
 
-        node_id = self.node_lookup[issue.id.__str__()]
-        parent_ids: list[int] = self.diagram.parents(node_id)  # type: ignore
-        parent_labels = [self.diagram.variable(pid).labels() for pid in parent_ids]  # type: ignore
+    def _create_explicit_utility_managers(
+        self, issues: list[IssueOutgoingDto]
+    ) -> list[DiscreteUtilityArrayManager]:
+        managers: list[DiscreteUtilityArrayManager] = []
+        for issue in issues:
+            if issue.type != Type.UTILITY.value or issue.utility is None:
+                continue
 
-        # Build all parent state combinations
-        parent_combinations = list(product(*parent_labels))
-        disc_utilities = [
-            utility for utility in self.discrete_utilities if utility.utility_id == issue.utility.id
-        ]
-        for combination in parent_combinations:
-            for utility in disc_utilities:
-                parents = [str(option_id) for option_id in utility.parent_option_ids] + [
-                    str(outcome_id) for outcome_id in utility.parent_outcome_ids
+            utilities = [
+                utility
+                for utility in self.discrete_utilities
+                if utility.utility_id == issue.utility.id
+            ]
+            if not utilities:
+                continue
+
+            node_id = self.node_lookup[str(issue.id)]
+            parent_ids: list[int] = list(self.diagram.parents(node_id))  # type: ignore
+            parent_dimensions = {
+                self.diagram.variable(parent_id).name(): list(  # type: ignore
+                    self.diagram.variable(parent_id).labels()  # type: ignore
+                )
+                for parent_id in parent_ids
+            }
+            managers.append(DiscreteUtilityArrayManager(utilities, parent_dimensions))
+        return managers
+
+    def _create_virtual_utility_managers(
+        self, issues: list[IssueOutgoingDto], value_metric_id: uuid.UUID
+    ) -> list[DiscreteUtilityArrayManager]:
+        managers: list[DiscreteUtilityArrayManager] = []
+        for issue in issues:
+            states: list[OptionOutgoingDto] | list[OutcomeOutgoingDto]
+            if issue.type == Type.DECISION.value and issue.decision is not None:
+                if all([option.utility == 0 for option in issue.decision.options]):
+                    continue
+                states = self._sort_state_dtos(issue.decision.options)
+                utilities = [
+                    DiscreteUtilityOutgoingDto(
+                        utility_id=issue.id,
+                        value_metric_id=value_metric_id,
+                        utility_value=state.utility,
+                        parent_option_ids=[state.id],
+                    )
+                    for state in states
                 ]
-                if all([x in parents for x in combination]):
-                    assign = {
-                        self.diagram.variable(parent_id).name(): state  # type: ignore
-                        for parent_id, state in zip(parent_ids, combination)
-                    }  # type: ignore
-                    self.diagram.utility(node_id)[assign] = utility.utility_value  # type: ignore
+            elif issue.type == Type.UNCERTAINTY.value and issue.uncertainty is not None:
+                if all([outcome.utility == 0 for outcome in issue.uncertainty.outcomes]):
+                    continue
+                states = self._sort_state_dtos(issue.uncertainty.outcomes)
+                utilities = [
+                    DiscreteUtilityOutgoingDto(
+                        utility_id=issue.id,
+                        value_metric_id=value_metric_id,
+                        utility_value=state.utility,
+                        parent_outcome_ids=[state.id],
+                    )
+                    for state in states
+                ]
+            else:
+                continue
 
-    def add_virtual_utility_node(self, issue: IssueOutgoingDto):
-        if issue.type == Type.UTILITY.value:
-            return
+            managers.append(
+                DiscreteUtilityArrayManager(
+                    utilities,
+                    {str(issue.id): [str(state.id) for state in states]},
+                )
+            )
+        return managers
 
-        if issue.type == Type.DECISION and issue.decision is not None:
-            if all([option.utility == 0 for option in issue.decision.options]):
-                return
+    def _erase_utility_nodes(self) -> None:
+        utility_node_ids = [
+            node_id
+            for node_id in self.diagram.nodes()  # type: ignore
+            if self.diagram.isUtilityNode(node_id)  # type: ignore
+        ]
+        for node_id in utility_node_ids:
+            self.diagram.erase(node_id)  # type: ignore
 
-        if issue.type == Type.UNCERTAINTY and issue.uncertainty is not None:
-            if all([outcome.utility == 0 for outcome in issue.uncertainty.outcomes]):
-                return
+        self.node_lookup = {
+            issue_id: node_id
+            for issue_id, node_id in self.node_lookup.items()
+            if node_id not in utility_node_ids
+        }
 
-        node_id = self.diagram.addUtilityNode(  # type: ignore
+    def combine_utility_nodes(self, issues: list[IssueOutgoingDto]) -> None:
+        value_metric_id = self._get_utility_value_metric_id()
+        managers = self._create_explicit_utility_managers(issues)
+        managers.extend(self._create_virtual_utility_managers(issues, value_metric_id))
+
+        utility_arrays = [manager.array for manager in managers]
+        combined_utility = (
+            reduce(add, utility_arrays)
+            if utility_arrays
+            else xr.DataArray(
+                [0.0],
+                dims=[DiscreteUtilityArrayManager.VALUE_METRICS_DIM],
+                coords={
+                    DiscreteUtilityArrayManager.VALUE_METRICS_DIM: [str(value_metric_id)]
+                },
+                name=DiscreteUtilityArrayManager.UTILITY_GRID_NAME,
+            )
+        )
+
+        parent_dimensions = [
+            dimension
+            for dimension in combined_utility.dims
+            if dimension != DiscreteUtilityArrayManager.VALUE_METRICS_DIM
+        ]
+        combined_utility = combined_utility.transpose(
+            *parent_dimensions, DiscreteUtilityArrayManager.VALUE_METRICS_DIM
+        )
+
+        self._erase_utility_nodes()
+        combined_node_id = self.diagram.addUtilityNode(  # type: ignore
             gum.LabelizedVariable(
-                f"{issue.id.__str__()} utility",
-                f"{issue.id.__str__()} utility",
+                _COMBINED_UTILITY_NODE_NAME,
+                _COMBINED_UTILITY_NODE_NAME,
                 1,
             )
         )
-        self.diagram.addArc(self.diagram.idFromName(issue.id.__str__()), node_id)  # type: ignore
 
-        if issue.type == Type.DECISION and issue.decision is not None:
-            for n, x in enumerate(self._sort_state_dtos(issue.decision.options)):
-                self.diagram.utility(node_id)[{issue.id.__str__(): n}] = x.utility  # type: ignore
+        parent_states: list[list[str]] = []
+        for dimension in parent_dimensions:
+            parent_id = self.diagram.idFromName(dimension)  # type: ignore
+            self.diagram.addArc(parent_id, combined_node_id)  # type: ignore
+            parent_states.append(
+                [str(state) for state in self.diagram.variable(parent_id).labels()]  # type: ignore
+            )
 
-        if issue.type == Type.UNCERTAINTY and issue.uncertainty is not None:
-            for n, x in enumerate(self._sort_state_dtos(issue.uncertainty.outcomes)):
-                self.diagram.utility(node_id)[{issue.id.__str__(): n}] = x.utility  # type: ignore
+        combined_values = np.asarray(combined_utility.values)
+        if not parent_dimensions:
+            self.diagram.utility(combined_node_id)[:] = float(combined_values[0])  # type: ignore
+            return
+
+        for indexes in product(*(range(len(states)) for states in parent_states)):
+            assignment = {
+                dimension: parent_states[index][state_index]
+                for index, (dimension, state_index) in enumerate(
+                    zip(parent_dimensions, indexes)
+                )
+            }
+            self.diagram.utility(combined_node_id)[assignment] = float(  # type: ignore
+                combined_values[indexes + (0,)]
+            )
 
     def add_edges(self, edges: list[EdgeOutgoingDto]):
         [self.add_edge(x) for x in edges]
@@ -501,18 +637,12 @@ class PyagrumSolver:
     def add_nodes(self, issues: list[IssueOutgoingDto]):
         [self.add_node(x) for x in issues]
 
-    def add_virtual_utilities(self, issues: list[IssueOutgoingDto]):
-        [self.add_virtual_utility_node(x) for x in issues]
-
-    def fill_utilities(self, issues: list[IssueOutgoingDto]):
-        [self.fill_utility_table(x) for x in issues]
-
     def get_policy_table(self, decision_issue_id: str) -> list[PolicyTableRowDto]:
         ie = self.get_inference()
         optimal_decision_tensor = ie.optimalDecision(decision_issue_id)  # type: ignore
         return self._parse_policy_tensor(decision_issue_id, optimal_decision_tensor)
 
-    def _get_option_id_from_policy_table_states(self, states: list[str]) -> str:
+    def _get_option_id_from_table_states(self, states: list[str]) -> str:
         option_ids = [
             str(option.id)
             for issue in self.issues
@@ -525,6 +655,37 @@ class PyagrumSolver:
 
         raise ValueError("No option ID found in policy states")
 
+    def _get_outcome_id_from_table_states(self, states: list[str]) -> str:
+        outcome_ids = [
+            str(outcome.id)
+            for issue in self.issues
+            if issue.uncertainty is not None
+            for outcome in issue.uncertainty.outcomes
+        ]
+        for state in states:
+            if state in outcome_ids:
+                return str(self._find_state_uncertainty(state).id)
+
+        raise ValueError("No outcome ID found in policy states")
+
+    def _parse_tensor(self, tensor: Any) -> list[ParsedTensor]:
+        inst: Any = gum.Instantiation(tensor)
+        variables: list[Any] = list(inst.variablesSequence())
+        parsed_rows: list[ParsedTensor] = []
+
+        inst.setFirst()
+        while not inst.end():
+            states = [str(variable.label(inst.val(variable))) for variable in variables]
+            value = float(tensor.get(inst))
+            parsed_rows.append(
+                ParsedTensor(
+                    states=states,
+                    value=value,
+                )
+            )
+            inst.inc()
+        return parsed_rows
+
     def _parse_policy_tensor(
         self, decision_issue_id: str, optimal_decision_tensor: Any
     ) -> list[PolicyTableRowDto]:
@@ -534,24 +695,40 @@ class PyagrumSolver:
         label into `states` (in tensor variable order), and reads the cell value for
         that assignment.
         """
-        inst: Any = gum.Instantiation(optimal_decision_tensor)
-        variables: list[Any] = list(inst.variablesSequence())
-        parsed_rows: list[PolicyTableRowDto] = []
-
-        inst.setFirst()
-        while not inst.end():
-            states = [str(variable.label(inst.val(variable))) for variable in variables]
-            value = float(optimal_decision_tensor.get(inst))
-            parsed_rows.append(
+        parsed_rows = self._parse_tensor(optimal_decision_tensor)
+        policy_rows: list[PolicyTableRowDto] = []
+        for parsed_row in parsed_rows:
+            policy_rows.append(
                 PolicyTableRowDto(
                     decision_id=uuid.UUID(decision_issue_id),
-                    parent_state_ids=[uuid.UUID(state) for state in states],
-                    option_id=uuid.UUID(self._get_option_id_from_policy_table_states(states)),
-                    value=value,
+                    parent_state_ids=[uuid.UUID(state) for state in parsed_row.states],
+                    option_id=uuid.UUID(self._get_option_id_from_table_states(parsed_row.states)),
+                    value=parsed_row.value,
                 )
             )
-            inst.inc()
-        return parsed_rows
+        return policy_rows
+
+    def _parse_margin_tensor(
+            self, uncertainty_id: str, margin_tensor: Any, evidence: list[str]
+        ) -> list[MarginTableRowDto]:
+            """Flatten a margin tensor into row DTOs with ordered state labels and probability.
+    
+            Iterates every Instantiation of the tensor, collects each variable's current
+            label into `states` (in tensor variable order), and reads the cell value for
+            that assignment.
+            """
+            parsed_rows = self._parse_tensor(margin_tensor)
+            margin_rows: list[MarginTableRowDto] = []
+            for parsed_row in parsed_rows:
+                margin_rows.append(
+                    MarginTableRowDto(
+                        uncertainty_id=uuid.UUID(uncertainty_id),
+                        outcome_id=uuid.UUID(self._get_outcome_id_from_table_states(parsed_row.states)),
+                        options_evidence=[uuid.UUID(option_id) for option_id in evidence],
+                        probability=parsed_row.value,
+                    )
+                )
+            return margin_rows
 
     def export_pyagrum_model(self) -> dict:
         with _EXPORT_MODEL_LOCK:
@@ -605,4 +782,62 @@ class PyagrumSolver:
                 value = value.replace(entity_id, name)
         return value
 
+    def fill_utility_table(self, issue: IssueOutgoingDto):
+        if issue.type in [Type.DECISION.value, Type.UNCERTAINTY.value]:
+            return
+        assert issue.utility is not None
+
+        node_id = self.node_lookup[issue.id.__str__()]
+        parent_ids: list[int] = self.diagram.parents(node_id)  # type: ignore
+        parent_labels = [self.diagram.variable(pid).labels() for pid in parent_ids]  # type: ignore
+
+        # Build all parent state combinations
+        parent_combinations = list(product(*parent_labels))
+        disc_utilities = [
+            utility for utility in self.discrete_utilities if utility.utility_id == issue.utility.id
+        ]
+        parent_dimensions = {
+            self.diagram.variable(parent_id).name(): list(parent_labels[index])  # type: ignore
+            for index, parent_id in enumerate(parent_ids)
+        }
+        discrete_utility_manager = DiscreteUtilityArrayManager(
+            disc_utilities, parent_dimensions
+        )
+        for combination in parent_combinations:
+            assign = {
+                self.diagram.variable(parent_id).name(): state  # type: ignore
+                for parent_id, state in zip(parent_ids, combination)
+            }
+            self.diagram.utility(node_id)[assign] = (  # type: ignore
+                discrete_utility_manager.get_utility_for_combination(combination)
+            )
+
+    def add_virtual_utility_node(self, issue: IssueOutgoingDto):
+        if issue.type == Type.UTILITY.value:
+            return
+
+        if issue.type == Type.DECISION and issue.decision is not None:
+            if all([option.utility == 0 for option in issue.decision.options]):
+                return
+
+        if issue.type == Type.UNCERTAINTY and issue.uncertainty is not None:
+            if all([outcome.utility == 0 for outcome in issue.uncertainty.outcomes]):
+                return
+
+        node_id = self.diagram.addUtilityNode(  # type: ignore
+            gum.LabelizedVariable(
+                f"{issue.id.__str__()} utility",
+                f"{issue.id.__str__()} utility",
+                1,
+            )
+        )
+        self.diagram.addArc(self.diagram.idFromName(issue.id.__str__()), node_id)  # type: ignore
+
+        if issue.type == Type.DECISION and issue.decision is not None:
+            for n, x in enumerate(self._sort_state_dtos(issue.decision.options)):
+                self.diagram.utility(node_id)[{issue.id.__str__(): n}] = x.utility  # type: ignore
+
+        if issue.type == Type.UNCERTAINTY and issue.uncertainty is not None:
+            for n, x in enumerate(self._sort_state_dtos(issue.uncertainty.outcomes)):
+                self.diagram.utility(node_id)[{issue.id.__str__(): n}] = x.utility  # type: ignore
     

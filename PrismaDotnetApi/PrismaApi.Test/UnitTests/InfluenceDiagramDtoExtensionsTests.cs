@@ -34,12 +34,18 @@ public class InfluenceDiagramDtoExtensionsTests
 
     private static InfluenceDiagramDto Diagram(
         IEnumerable<DiscreteProbabilityDto> cells,
-        IEnumerable<RestrictionTableOutgoingDto>? restrictionTables = null) =>
+        IEnumerable<RestrictionTableOutgoingDto>? restrictionTables = null,
+        IEnumerable<EdgeOutgoingDto>? edges = null) =>
         new()
         {
             projectId = ProjectId,
-            issues = new List<IssueOutgoingDto>(),
-            edges = new List<EdgeOutgoingDto>(),
+            // Every issue an edge touches must exist: ApplyRestrictions walks them.
+            issues = (edges ?? Enumerable.Empty<EdgeOutgoingDto>())
+                .SelectMany(edge => new[] { edge.TailIssueId, edge.HeadIssueId })
+                .Distinct()
+                .Select(id => new IssueOutgoingDto { Id = id, ProjectId = ProjectId })
+                .ToList(),
+            edges = edges?.ToList() ?? new List<EdgeOutgoingDto>(),
             discreteProbabilities = cells.ToList(),
             discreteUtilities = new List<DiscreteUtilityDto>(),
             restrictionTables = restrictionTables?.ToList() ?? new List<RestrictionTableOutgoingDto>(),
@@ -130,7 +136,9 @@ public class InfluenceDiagramDtoExtensionsTests
         RestrictedSiblingModel()
     {
         // A (three outcomes) and B (two) are both conditioned on option d of a decision.
-        // One restriction entry forbids A's third outcome under d.
+        // The restriction table on the edge decision -> A allows A's first two outcomes
+        // under d and forbids the third.
+        var decision = Guid.NewGuid();
         var d = Guid.NewGuid();
         var a = Guid.NewGuid(); var a0 = Guid.NewGuid(); var a1 = Guid.NewGuid(); var a2 = Guid.NewGuid();
         var b = Guid.NewGuid(); var b0 = Guid.NewGuid(); var b1 = Guid.NewGuid();
@@ -149,21 +157,21 @@ public class InfluenceDiagramDtoExtensionsTests
             Id = tableId,
             ProjectId = ProjectId,
             EdgeId = edgeId,
-            RestrictionEntries = new List<RestrictionEntryOutgoingDto>
-            {
-                new()
+            RestrictionEntries = new[] { (a0, 1), (a1, 1), (a2, 0) }
+                .Select(entry => new RestrictionEntryOutgoingDto
                 {
                     ProjectId = ProjectId,
                     RestrictionTableId = tableId,
-                    RestrictionValue = 0,
+                    RestrictionValue = entry.Item2,
                     ParentStateId = d,
                     IsParentUncertainty = false,
-                    ChildStateId = a2,
+                    ChildStateId = entry.Item1,
                     IsChildUncertainty = true,
-                },
-            },
+                })
+                .ToList(),
         };
-        return (Diagram(cells, new[] { table }), d, a, a0, a1, a2, b0, b1, tableId, edgeId);
+        var edge = new EdgeOutgoingDto { Id = edgeId, ProjectId = ProjectId, TailIssueId = decision, HeadIssueId = a };
+        return (Diagram(cells, new[] { table }, new[] { edge }), d, a, a0, a1, a2, b0, b1, tableId, edgeId);
     }
 
     [Fact]
@@ -224,7 +232,7 @@ public class InfluenceDiagramDtoExtensionsTests
         var (restricted, d, a, ra0, ra1, ra2, rb0, rb1, _, _) = RestrictedSiblingModel();
         var reversedCells = Enumerable.Reverse(restricted.discreteProbabilities.ToList())
             .Select(dp => Cell(dp.UncertaintyId, dp.OutcomeId, dp.Probability!.Value, dp.ParentOutcomeIds, dp.ParentOptionIds));
-        var restrictedReversed = Diagram(reversedCells, restricted.restrictionTables);
+        var restrictedReversed = Diagram(reversedCells, restricted.restrictionTables, restricted.edges);
         restrictedReversed.ApplyRestrictions();
         Assert.Equal(0.625, CellValue(restrictedReversed, ra0, d), Tolerance);
         Assert.Equal(0.375, CellValue(restrictedReversed, ra1, d), Tolerance);
