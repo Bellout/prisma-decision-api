@@ -97,9 +97,12 @@ public static class DiscreteProbabilitiesExtensions
 
     private static List<IGrouping<string, DiscreteProbabilityDto>> SeperateByRow(this ICollection<DiscreteProbabilityDto> probabilities)
     {
-        // a row shares all parent option ids and all parent outcome ids
+        // a row is one uncertainty under one configuration of its parents: it shares
+        // the uncertainty id, all parent option ids and all parent outcome ids. Rows of
+        // different uncertainties that share a parent configuration are separate rows.
         var rowsGrouping = probabilities.GroupBy(dp =>
-            string.Join(",", dp.ParentOptionIds.OrderBy(x => x)
+            string.Join(",", new[] { dp.UncertaintyId }
+                .Concat(dp.ParentOptionIds.OrderBy(x => x))
                 .Concat(dp.ParentOutcomeIds.OrderBy(x => x))))
             .ToList();
         return rowsGrouping;
