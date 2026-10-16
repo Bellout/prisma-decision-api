@@ -37,6 +37,13 @@ COPY /PrismaFastApi/ /code/
 
 WORKDIR /code/src
 
+# Endpoint counter (eqx_prisma F019): the vendored, standalone dtcount
+# procedure, built with the compiler the image already has.
+RUN g++ -std=gnu++17 -O2 -I vendor/dtcount/cpp/include vendor/dtcount/cpp/src/*.cpp \
+        -o /usr/local/bin/dtcount && \
+    /usr/local/bin/dtcount --version
+ENV DTCOUNT_BIN=/usr/local/bin/dtcount
+
 # Add a new group "non-root-group" with group id 1001 and user "non-root-user" with the same id
 RUN groupadd --gid 1001 non-root-group && \
     useradd --uid 1001 --gid 1001 --create-home non-root-user

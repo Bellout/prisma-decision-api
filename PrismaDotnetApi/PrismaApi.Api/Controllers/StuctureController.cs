@@ -61,6 +61,27 @@ public class StuctureController : PrismaBaseController
         return StatusCode((int)fastApiResponse.StatusCode, fastApiResponse.Content);
     }
 
+    /// <summary>
+    /// Endpoints of the decision tree after structural pruning, counted by the
+    /// external dtcount procedure behind the FastAPI route (eqx_prisma F019).
+    /// Read-only pass-through, like partial_order; `debug=input` returns the
+    /// counting problem instead of the count.
+    /// </summary>
+    [HttpGet("structure/{projectId:guid}/endpoint_count")]
+    public async Task<ActionResult<ApiResponseDto>> GetEndpointCountAsync([FromRoute] Guid projectId, [FromQuery] string? debug = null, CancellationToken ct = default)
+    {
+        UserOutgoingDto user = HttpContext.GetLoadedUser();
+        var endpoint = $"/structure/{projectId}/endpoint_count" + (debug == "input" ? "?debug=input" : string.Empty);
+        var fastApiResponse = await _fastApiService.SendInfluenceDiagramToFastApiAsync(projectId, endpoint, user, true, ct);
+
+        if (fastApiResponse.StatusCode == HttpStatusCode.OK)
+        {
+            return Ok(!string.IsNullOrEmpty(fastApiResponse.Content) ? fastApiResponse.Content.SanitizeLogString() : null);
+        }
+
+        return StatusCode((int)fastApiResponse.StatusCode, fastApiResponse.Content);
+    }
+
     [HttpGet("structure/{projectId:guid}/decision_tree/v3")]
     public async Task<ActionResult<ApiResponseDto>> GetDecisionTreeV3Async([FromRoute] Guid projectId, CancellationToken ct = default)
     {
